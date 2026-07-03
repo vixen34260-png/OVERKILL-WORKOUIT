@@ -27,6 +27,7 @@ clock.
 | Hotkey | Action |
 |--------|--------|
 | **Ctrl + Alt + W** | Show a workout reminder right now (test / manual trigger) |
+| **Ctrl + Alt + S** | Open / close the settings menu |
 | **Ctrl + Alt + H** | Hide / show the overlay |
 | **Ctrl + Alt + P** | Pause / resume watching |
 | **Ctrl + Alt + M** | Move the overlay (unlock to drag; press again or Esc to lock) |
@@ -37,8 +38,26 @@ says *"Drag me"* — now drag it anywhere with the mouse. Press **Ctrl + Alt + M
 again (or **Esc**) to lock it back to click-through. Its new spot is remembered
 for next time.
 
-The tray icon (right-click) has the same actions plus sensitivity and the workout
-list. Double-click the tray icon to un-hide the overlay.
+The tray icon (right-click) has the same actions. Double-click the tray icon to
+un-hide the overlay.
+
+## Settings menu (Ctrl + Alt + S)
+
+A clean pop-up menu where everything saves automatically as you change it:
+
+- **Workouts** — a checkbox next to each exercise to turn it on/off, and (for the
+  ones that are on) **−** / **+** buttons to set the amount: reps change by 1, and
+  timed exercises like the plank change by 5 seconds. (You can still add/remove
+  exercises by editing the list in Notepad from the tray menu.)
+- **Daily goal** — the rep target for the day; use **−** / **+** to change it. The
+  overlay bar fills toward this as you complete workouts, and resets each day.
+- **All-time reps** — your lifetime total, counted automatically every time you
+  finish a workout. Never resets.
+- **Show shortcuts on overlay** — when on, the overlay lists all the hotkeys so
+  you don't have to remember them.
+
+Each completed reminder adds its reps to both today's progress and your all-time
+total. (The manual **Ctrl+Alt+W** test doesn't count.)
 
 ---
 
@@ -68,8 +87,12 @@ closed the overlay shows *"Waiting for Roblox…"* and nothing fires. (The manua
 
 - The **confidence bar** on the overlay shows how sure it is right now (it stays
   near empty during play and jumps toward full on the results screen).
-- One reminder per match: it won't fire again until the results screen goes away
-  and a short cooldown passes.
+- One reminder per match: after it reminds you, the overlay shows **"Match ended
+  ✓ — reminded"** and stays that way until the results screen has actually been
+  gone for a few seconds. A brief flicker (like your cursor passing over a button)
+  won't make it re-remind or flip back to "watching".
+- The popup ignores input for its first fraction of a second, so a stray in-game
+  keypress can't dismiss it before you notice it.
 - If it ever fires too easily or misses, use **More sensitive / Less sensitive**
   in the tray icon menu.
 
