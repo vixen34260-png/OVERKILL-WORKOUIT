@@ -35,7 +35,9 @@
 // ------------------------------------------------------------------ constants
 static const int GRID_W = 320;          // downscaled screen used for detection
 static const int GRID_H = 180;
-static const int REQUIRED_STREAK = 2;   // positive polls (leaky) before firing
+static const int POLL_MS = 200;         // how often the screen is checked (fast = snappy)
+static const int REQUIRED_STREAK = 2;   // positive polls (leaky) before firing (borderline)
+static const int INSTANT_CONF = 85;     // ...but fire on the FIRST read this confident
 static const int STREAK_CAP = 3;        // max the leaky streak counter climbs to
 static const int REARM_SEC = 4;         // end screen must be gone this long before reminding again
 static const DWORD REMIND_GUARD_MS = 800; // ignore input this long after a reminder appears
@@ -60,12 +62,10 @@ static const wchar_t* SETTINGS_CLASS = L"OvrkSettingsWnd";
 #define IDM_GOAL_BASE 230    // 230..235 = daily-goal presets
 
 #define ID_BTN_DONE  301
-#define HK_TRIGGER   1
-#define HK_HIDE      2
-#define HK_PAUSE     3
-#define HK_QUIT      4
-#define HK_MOVE      5
-#define HK_SETTINGS  6
+
+// rebindable hotkey actions (the id is also the RegisterHotKey id)
+enum HotAction { ACT_TEST=0, ACT_SETTINGS, ACT_SETTINGS2, ACT_HIDE, ACT_PAUSE, ACT_MOVE, ACT_QUIT, ACT_COUNT };
+struct Bind { UINT mods; UINT vk; };   // mods = MOD_CONTROL/ALT/SHIFT/WIN; vk = virtual key
 
 // palette
 static const COLORREF C_BG       = RGB(21, 23, 30);
@@ -112,6 +112,10 @@ static bool   g_robloxOpen = false;
 static time_t g_lastHigh  = 0;       // last time detection confidence was above threshold
 static int    g_lastConf  = 0;
 static int    g_hitStreak = 0;   // leaky counter of positive detection polls
+static Bind   g_binds[ACT_COUNT];    // current hotkey bindings
+static bool   g_bindOk[ACT_COUNT];   // did each one register OK (false = combo taken by another app)
+static int    g_rebindAction  = -1;  // action currently capturing a new key (-1 = none)
+
 static DWORD  g_remindShownAt = 0;   // tick when the current reminder popup appeared
 static bool   g_remindCounts  = false; // completing this reminder adds to the goal
 static int    g_pendingReps   = 0;   // reps the current reminder is worth
@@ -258,11 +262,20 @@ static const std::wstring& pickWorkout() {
 }
 
 // ------------------------------------------------------------------- persistence
+static void defaultBinds() {
+    g_binds[ACT_TEST]      = { MOD_CONTROL|MOD_ALT,   'W' };
+    g_binds[ACT_SETTINGS]  = { MOD_CONTROL|MOD_ALT,   'S' };
+    g_binds[ACT_SETTINGS2] = { MOD_CONTROL|MOD_SHIFT, 'S' };   // backup for settings
+    g_binds[ACT_HIDE]      = { MOD_CONTROL|MOD_ALT,   'H' };
+    g_binds[ACT_PAUSE]     = { MOD_CONTROL|MOD_ALT,   'P' };
+    g_binds[ACT_MOVE]      = { MOD_CONTROL|MOD_ALT,   'M' };
+    g_binds[ACT_QUIT]      = { MOD_CONTROL|MOD_ALT,   'X' };
+}
 static void saveConfig() {
     FILE* f = _wfopen(configFile().c_str(), L"wb");
     if (!f) return;
     const char magic[4] = {'O','V','R','K'};
-    int32_t version = 7, th = g_cfg.threshold, pm = g_cfg.pollMs, cd = g_cfg.cooldownSec;
+    int32_t version = 8, th = g_cfg.threshold, pm = g_cfg.pollMs, cd = g_cfg.cooldownSec;
     int32_t px = g_cfg.posX, py = g_cfg.posY;
     int32_t gl = g_cfg.goal, pr = g_cfg.progress, pd = g_cfg.progDay;
     int32_t lt = g_cfg.lifetime, sk = g_cfg.showKeys;
@@ -271,25 +284,31 @@ static void saveConfig() {
     fwrite(&px,4,1,f); fwrite(&py,4,1,f);
     fwrite(&gl,4,1,f); fwrite(&pr,4,1,f); fwrite(&pd,4,1,f);
     fwrite(&lt,4,1,f); fwrite(&sk,4,1,f);
+    for (int i = 0; i < ACT_COUNT; ++i) {
+        int32_t m = g_binds[i].mods, v = g_binds[i].vk;
+        fwrite(&m,4,1,f); fwrite(&v,4,1,f);
+    }
     fclose(f);
 }
 static void loadConfig() {
     FILE* f = _wfopen(configFile().c_str(), L"rb");
     if (!f) return;
-    char magic[4];
-    int32_t version=0, th=60, pm=450, cd=25, px=-1, py=-1, gl=100, pr=0, pd=0, lt=0, sk=0;
-    if (fread(magic,1,4,f)==4 && memcmp(magic,"OVRK",4)==0) {
-        fread(&version,4,1,f);
-        if (version == 7) {   // older versions reset to the new defaults
-            fread(&th,4,1,f); fread(&pm,4,1,f); fread(&cd,4,1,f);
-            fread(&px,4,1,f); fread(&py,4,1,f);
-            fread(&gl,4,1,f); fread(&pr,4,1,f); fread(&pd,4,1,f);
-            fread(&lt,4,1,f); fread(&sk,4,1,f);
-            g_cfg.threshold=th; g_cfg.pollMs=pm; g_cfg.cooldownSec=cd;
-            g_cfg.posX=px; g_cfg.posY=py;
-            g_cfg.goal=gl; g_cfg.progress=pr; g_cfg.progDay=pd;
-            g_cfg.lifetime=lt; g_cfg.showKeys=sk;
-        }
+    char magic[4]; int32_t version = 0;
+    if (fread(magic,1,4,f)!=4 || memcmp(magic,"OVRK",4)!=0) { fclose(f); return; }
+    fread(&version,4,1,f);
+    // Read fields in the fixed order they were ADDED. Fields are only ever appended,
+    // so an older/shorter file simply runs out of data and the rest keep their
+    // defaults — never wiping your progress/goal/totals when the app updates.
+    int32_t v;
+    auto rd = [&](int32_t& dst){ if (fread(&v,4,1,f)==1) dst = v; };
+    rd(g_cfg.threshold); rd(g_cfg.pollMs); rd(g_cfg.cooldownSec);
+    rd(g_cfg.posX); rd(g_cfg.posY);
+    rd(g_cfg.goal); rd(g_cfg.progress); rd(g_cfg.progDay);
+    rd(g_cfg.lifetime); rd(g_cfg.showKeys);
+    for (int i = 0; i < ACT_COUNT; ++i) {
+        int32_t m, k;
+        if (fread(&m,4,1,f)==1 && fread(&k,4,1,f)==1) { g_binds[i].mods=m; g_binds[i].vk=k; }
+        else break;
     }
     fclose(f);
 }
@@ -301,6 +320,53 @@ static int todayInt() {
 static void checkDayRollover() {
     int d = todayInt();
     if (g_cfg.progDay != d) { g_cfg.progDay = d; g_cfg.progress = 0; saveConfig(); }
+}
+
+// ------------------------------------------------------------------- hotkeys
+static std::wstring vkName(UINT vk) {
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) return std::wstring(1, (wchar_t)vk);
+    if (vk >= VK_F1 && vk <= VK_F24) { wchar_t b[8]; swprintf_s(b, L"F%d", vk - VK_F1 + 1); return b; }
+    switch (vk) {
+        case 0:            return L"(unset)";
+        case VK_SPACE:     return L"Space";
+        case VK_OEM_3:     return L"`";
+        case VK_OEM_MINUS: return L"-";
+        case VK_OEM_PLUS:  return L"=";
+        case VK_OEM_COMMA: return L",";
+        case VK_OEM_PERIOD:return L".";
+    }
+    wchar_t b[8]; swprintf_s(b, L"0x%02X", vk); return b;
+}
+static std::wstring bindToText(const Bind& b) {
+    std::wstring s;
+    if (b.mods & MOD_CONTROL) s += L"Ctrl+";
+    if (b.mods & MOD_ALT)     s += L"Alt+";
+    if (b.mods & MOD_SHIFT)   s += L"Shift+";
+    if (b.mods & MOD_WIN)     s += L"Win+";
+    s += vkName(b.vk);
+    return s;
+}
+static const wchar_t* actionName(int a) {
+    switch (a) {
+        case ACT_TEST:      return L"Test reminder";
+        case ACT_SETTINGS:  return L"Open settings";
+        case ACT_SETTINGS2: return L"Open settings (backup)";
+        case ACT_HIDE:      return L"Hide / show overlay";
+        case ACT_PAUSE:     return L"Pause / resume";
+        case ACT_MOVE:      return L"Move overlay";
+        case ACT_QUIT:      return L"Quit app";
+    }
+    return L"";
+}
+static void registerHotkeys(HWND hwnd) {
+    for (int i = 0; i < ACT_COUNT; ++i) {
+        UnregisterHotKey(hwnd, i);
+        g_bindOk[i] = (g_binds[i].vk != 0) &&
+            RegisterHotKey(hwnd, i, g_binds[i].mods | MOD_NOREPEAT, g_binds[i].vk) != 0;
+    }
+}
+static void unregisterHotkeys(HWND hwnd) {
+    for (int i = 0; i < ACT_COUNT; ++i) UnregisterHotKey(hwnd, i);
 }
 
 // ------------------------------------------------------------------- detection
@@ -391,9 +457,10 @@ static int detectEndScreen(const uint8_t* p) {
         for (int x = sxL; x < sxR; ++x) {
             const uint8_t* px = p + (y * GRID_W + x) * 4;
             int b = px[0], g = px[1], r = px[2];
-            // strong BLUE dominance: the button is cool blue-violet, unlike warm
-            // magenta/lavender map purples (where red ~= blue)
-            if (b > 160 && b > r + 35 && b > g + 45 && g < 150) {
+            // "Rematch" is VIOLET: blue-dominant AND red > green. That rejects warm
+            // magenta/lavender map purples (b ~= r) and also the blue "Report" button
+            // / blue water on blue maps (g > r), which are blue but NOT violet.
+            if (b > 160 && b > r + 30 && b > g + 40 && r > g + 5 && g < 150) {
                 pN++; if(x<pX0)pX0=x; if(x>pX1)pX1=x; if(y<pY0)pY0=y; if(y>pY1)pY1=y;
             }
         }
@@ -409,7 +476,7 @@ static int detectEndScreen(const uint8_t* p) {
     if (rH>pH*2.0 || pH>rH*2.0) return 0;              // similar heights
     if (rW>pW*2.6 || pW>rW*2.6) return 0;              // similar widths
     double cx = ((rX0+pX1)/2.0)/GRID_W;
-    if (cx < 0.38 || cx > 0.62) return 0;              // centred on screen
+    if (cx < 0.34 || cx > 0.66) return 0;              // roughly centred (3-button layouts shift it)
 
     double q = rFill<pFill ? rFill : pFill;
     int conf = 70 + (int)((q - 0.35) / 0.45 * 30.0);   // fill .35 -> 70,  .80 -> 100
@@ -516,12 +583,14 @@ static void setMoveMode(bool on) {
 static void showTrayMenu() {
     POINT pt; GetCursorPos(&pt);
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, IDM_TOGGLE, g_watching ? L"Pause watching\tCtrl+Alt+P" : L"Resume watching\tCtrl+Alt+P");
-    AppendMenuW(m, MF_STRING, IDM_TEST,   L"Test reminder\tCtrl+Alt+W");
-    AppendMenuW(m, MF_STRING, IDM_SETTINGS, L"Settings…\tCtrl+Alt+S");
-    AppendMenuW(m, MF_STRING, IDM_SHOW,   L"Hide / show overlay\tCtrl+Alt+H");
-    AppendMenuW(m, MF_STRING, IDM_MOVE,   g_moveMode ? L"Lock overlay position\tCtrl+Alt+M"
-                                                     : L"Move overlay\tCtrl+Alt+M");
+    auto lab = [](const wchar_t* name, int act) {   // "Name\tCtrl+Alt+X" from live binding
+        return std::wstring(name) + L"\t" + bindToText(g_binds[act]);
+    };
+    AppendMenuW(m, MF_STRING, IDM_TOGGLE, lab(g_watching ? L"Pause watching" : L"Resume watching", ACT_PAUSE).c_str());
+    AppendMenuW(m, MF_STRING, IDM_TEST,   lab(L"Test reminder", ACT_TEST).c_str());
+    AppendMenuW(m, MF_STRING, IDM_SETTINGS, lab(L"Settings…", ACT_SETTINGS).c_str());
+    AppendMenuW(m, MF_STRING, IDM_SHOW,   lab(L"Hide / show overlay", ACT_HIDE).c_str());
+    AppendMenuW(m, MF_STRING, IDM_MOVE,   lab(g_moveMode ? L"Lock overlay position" : L"Move overlay", ACT_MOVE).c_str());
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     // daily goal submenu
     static const int presets[6] = {25, 50, 75, 100, 150, 200};
@@ -538,7 +607,7 @@ static void showTrayMenu() {
     AppendMenuW(m, MF_STRING, IDM_LESSSENS, L"Less sensitive");
     AppendMenuW(m, MF_STRING, IDM_WORKOUTS, L"Edit workout list…");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, IDM_EXIT, L"Exit\tCtrl+Alt+X");
+    AppendMenuW(m, MF_STRING, IDM_EXIT, lab(L"Exit", ACT_QUIT).c_str());
     SetForegroundWindow(g_main);
     TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_main, nullptr);
     DestroyMenu(m);
@@ -679,22 +748,20 @@ static void paintMain(HWND hwnd) {
         fillRound(dc, fb, 4, done ? C_AMBER : C_GREEN);
     }
 
-    // optional shortcut list
+    // optional shortcut list (reflects your current bindings)
     if (g_cfg.showKeys) {
         RECT sep = {16, 97, rc.right-16, 98}; fillRound(dc, sep, 0, C_BORDER);
         int ky = 102;
         SelectObject(dc, g_fTiny); SetTextColor(dc, C_SUB);
         TextOutW(dc, 16, ky, L"SHORTCUTS", 9); ky += 20;
-        static const wchar_t* K[6][2] = {
-            {L"Ctrl+Alt+W", L"Test reminder"}, {L"Ctrl+Alt+S", L"Settings"},
-            {L"Ctrl+Alt+H", L"Hide / show"},   {L"Ctrl+Alt+M", L"Move overlay"},
-            {L"Ctrl+Alt+P", L"Pause"},         {L"Ctrl+Alt+X", L"Quit"},
-        };
+        int acts[6] = { ACT_TEST, ACT_SETTINGS, ACT_HIDE, ACT_MOVE, ACT_PAUSE, ACT_QUIT };
+        const wchar_t* nm[6] = { L"Test", L"Settings", L"Hide / show", L"Move", L"Pause", L"Quit" };
         for (int i = 0; i < 6; ++i) {
-            SetTextColor(dc, RGB(120,200,255));
-            TextOutW(dc, 16, ky, K[i][0], (int)wcslen(K[i][0]));
+            std::wstring kb = bindToText(g_binds[acts[i]]);
+            SetTextColor(dc, g_bindOk[acts[i]] ? RGB(120,200,255) : RGB(230,110,110));
+            TextOutW(dc, 16, ky, kb.c_str(), (int)kb.size());
             SetTextColor(dc, C_SUB);
-            TextOutW(dc, 110, ky, K[i][1], (int)wcslen(K[i][1]));
+            TextOutW(dc, 124, ky, nm[i], (int)wcslen(nm[i]));
             ky += 16;
         }
     }
@@ -724,9 +791,12 @@ struct SettingsLayout {
     RECT wkRow[24], wkBox[24], wkMinus[24], wkPlus[24];
     RECT goalMinus, goalPlus;  int goalRowY;
     int  allTimeY;
+    int  addRowY;  RECT addBtn[3];   // "+5 / +10 / +25" offline-reps chips
     RECT keysRow, keysSwitch;  int keysRowY;
+    int  shortHdrY;  RECT bindRow[ACT_COUNT], bindBtn[ACT_COUNT];
     int  footerY, height;
 };
+static const int ADD_AMOUNTS[3] = {5, 10, 25};
 static SettingsLayout setLayout(int cw) {
     SettingsLayout L; L.nwk = (int)g_workouts.size(); if (L.nwk > 24) L.nwk = 24;
     int pad = 20, y = 56;
@@ -744,10 +814,24 @@ static SettingsLayout setLayout(int cw) {
     L.goalPlus  = { cw - pad - 26, y - 2, cw - pad,      y + 24 };
     y += 42;
     L.allTimeY  = y; y += 42;
+    L.addRowY   = y;                            // add reps done away from the app
+    for (int i = 0; i < 3; ++i) {
+        int bw = 46, gap2 = 8;
+        int xr = cw - pad - (2 - i) * (bw + gap2);   // right-aligned row of 3 chips
+        L.addBtn[i] = { xr - bw, y - 2, xr, y + 24 };
+    }
+    y += 42;
     L.keysRowY  = y;
     L.keysRow   = { pad, y - 2, cw - pad, y + 24 };
     L.keysSwitch= { cw - pad - 46, y, cw - pad, y + 24 };
-    y += 42;
+    y += 44;
+    L.shortHdrY = y; y += 26;                   // "SHORTCUTS" section
+    for (int i = 0; i < ACT_COUNT; ++i) {
+        L.bindRow[i] = { pad, y, cw - pad, y + 28 };
+        L.bindBtn[i] = { cw - pad - 122, y + 1, cw - pad, y + 27 };
+        y += 30;
+    }
+    y += 10;
     L.footerY   = y; y += 28;
     L.height    = y;
     return L;
@@ -763,6 +847,8 @@ static int setHitTest(const SettingsLayout& L, POINT p) {
     if (PtInRect(&L.goalMinus, p)) return -1;
     if (PtInRect(&L.goalPlus,  p)) return -2;
     if (PtInRect(&L.keysRow,   p)) return -3;
+    for (int i = 0; i < 3; ++i) if (PtInRect(&L.addBtn[i], p)) return -(4 + i);
+    for (int i = 0; i < ACT_COUNT; ++i) if (PtInRect(&L.bindBtn[i], p)) return 4000 + i;
     return 0;
 }
 static void drawCheck(HDC dc, RECT b, bool on, bool hover) {
@@ -839,14 +925,38 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         RECT ltr = { 20, L.allTimeY-2, rc.right-20, L.allTimeY+24 };
         DrawTextW(dc, lt, -1, &ltr, DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
 
+        // log reps done away from the app
+        SelectObject(dc, g_fStatus); SetTextColor(dc, C_TITLE);
+        TextOutW(dc, 20, L.addRowY, L"Add offline reps", 16);
+        for (int i = 0; i < 3; ++i) {
+            wchar_t ab[8]; swprintf_s(ab, L"+%d", ADD_AMOUNTS[i]);
+            drawStepBtn(dc, L.addBtn[i], ab, g_setHover == -(4 + i));
+        }
+
         // show shortcuts toggle
         SelectObject(dc, g_fStatus); SetTextColor(dc, C_TITLE);
         TextOutW(dc, 20, L.keysRowY, L"Show shortcuts on overlay", 25);
         drawSwitch(dc, L.keysSwitch, g_cfg.showKeys != 0);
 
+        // rebindable shortcuts
+        SelectObject(dc, g_fTiny); SetTextColor(dc, C_SUB);
+        TextOutW(dc, 20, L.shortHdrY, L"SHORTCUTS  (click a key to change)", 34);
+        for (int i = 0; i < ACT_COUNT; ++i) {
+            SelectObject(dc, g_fStatus); SetTextColor(dc, C_TITLE);
+            RECT nr = { 20, L.bindRow[i].top, L.bindBtn[i].left - 8, L.bindRow[i].bottom };
+            DrawTextW(dc, actionName(i), -1, &nr, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            bool cap = (g_rebindAction == i);
+            fillRound(dc, L.bindBtn[i], 7, (g_setHover==4000+i || cap) ? C_BTN_HOV : C_BTN);
+            SelectObject(dc, g_fTiny);
+            std::wstring bt = cap ? L"press keys…" : bindToText(g_binds[i]);
+            SetTextColor(dc, cap ? C_AMBER : (g_bindOk[i] ? C_BTN_TXT : RGB(230,110,110)));
+            DrawTextW(dc, bt.c_str(), -1, &L.bindBtn[i], DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        }
+
         SelectObject(dc, g_fTiny); SetTextColor(dc, RGB(110,115,125));
         RECT fr = {0, L.footerY, rc.right, L.footerY+18};
-        DrawTextW(dc, L"Changes save automatically  ·  Esc or Ctrl+Alt+S to close", -1, &fr, DT_CENTER|DT_SINGLELINE);
+        DrawTextW(dc, L"Saves automatically  ·  red = key in use by another app  ·  Esc closes",
+                  -1, &fr, DT_CENTER|DT_SINGLELINE);
 
         BitBlt(hdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
         SelectObject(dc, old); DeleteObject(bmp); DeleteDC(dc);
@@ -888,12 +998,49 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         } else if (code == -3) {
             g_cfg.showKeys = g_cfg.showKeys ? 0 : 1;
             saveConfig(); updateHudSize(); InvalidateRect(hwnd,nullptr,FALSE);
+        } else if (code <= -4 && code >= -6) {
+            // log reps done away from the app: counts toward today AND all-time
+            checkDayRollover();
+            int amt = ADD_AMOUNTS[-code - 4];
+            g_cfg.progress += amt;
+            g_cfg.lifetime += amt;
+            saveConfig();
+            InvalidateRect(hwnd,nullptr,FALSE); InvalidateRect(g_main,nullptr,FALSE);
+        } else if (code >= 4000) {
+            // start capturing a new key for this action; suspend global hotkeys so
+            // the combo the user presses reaches us instead of firing an action
+            g_rebindAction = code - 4000;
+            unregisterHotkeys(g_main);
+            InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
     }
-    case WM_KEYDOWN: if (wp==VK_ESCAPE) DestroyWindow(hwnd); return 0;
+    case WM_KEYDOWN:
+        if (g_rebindAction >= 0) {                       // capturing a new binding
+            if (wp==VK_ESCAPE) { g_rebindAction=-1; registerHotkeys(g_main); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
+            if (wp==VK_CONTROL||wp==VK_MENU||wp==VK_SHIFT||wp==VK_LWIN||wp==VK_RWIN||
+                wp==VK_LCONTROL||wp==VK_RCONTROL||wp==VK_LMENU||wp==VK_RMENU||
+                wp==VK_LSHIFT||wp==VK_RSHIFT) return 0;   // wait for a non-modifier key
+            UINT mods = 0;
+            if (GetKeyState(VK_CONTROL)&0x8000) mods |= MOD_CONTROL;
+            if (GetKeyState(VK_MENU)&0x8000)    mods |= MOD_ALT;
+            if (GetKeyState(VK_SHIFT)&0x8000)   mods |= MOD_SHIFT;
+            if ((GetKeyState(VK_LWIN)&0x8000)||(GetKeyState(VK_RWIN)&0x8000)) mods |= MOD_WIN;
+            bool isFn = (wp>=VK_F1 && wp<=VK_F24);
+            if (mods==0 && !isFn) return 0;               // require a modifier (F-keys may be bare)
+            g_binds[g_rebindAction] = { mods, (UINT)wp };
+            g_rebindAction = -1;
+            saveConfig(); registerHotkeys(g_main);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+        if (wp==VK_ESCAPE) DestroyWindow(hwnd);
+        return 0;
     case WM_CLOSE: DestroyWindow(hwnd); return 0;
-    case WM_DESTROY: g_settings = nullptr; return 0;
+    case WM_DESTROY:
+        g_settings = nullptr;
+        if (g_rebindAction >= 0) { g_rebindAction = -1; registerHotkeys(g_main); }  // restore if closed mid-rebind
+        return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -921,14 +1068,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
         addTray();
-        SetTimer(hwnd, IDT_POLL, g_cfg.pollMs, nullptr);
-        UINT mod = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
-        RegisterHotKey(hwnd, HK_TRIGGER, mod, 'W');   // test / trigger now
-        RegisterHotKey(hwnd, HK_HIDE,    mod, 'H');   // hide / show overlay
-        RegisterHotKey(hwnd, HK_PAUSE,   mod, 'P');   // pause / resume watching
-        RegisterHotKey(hwnd, HK_QUIT,    mod, 'X');   // close app entirely
-        RegisterHotKey(hwnd, HK_MOVE,    mod, 'M');   // unlock / lock for dragging
-        RegisterHotKey(hwnd, HK_SETTINGS,mod, 'S');   // open / close settings
+        SetTimer(hwnd, IDT_POLL, POLL_MS, nullptr);
+        registerHotkeys(hwnd);
         return 0;
     }
     case WM_TIMER:
@@ -947,11 +1088,12 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     bool fired = false;
                     if (conf >= g_cfg.threshold) {
                         g_lastHigh = now;
-                        // leaky confirmation: climbs on hits, decays on misses, so a
-                        // one-frame mid-game flash can't reach REQUIRED_STREAK but the
-                        // real screen does — and a single dropped frame won't reset it.
                         if (g_hitStreak < STREAK_CAP) g_hitStreak++;
-                        if (g_hitStreak >= REQUIRED_STREAK && !g_reminded) {
+                        // Fire immediately if this read is clearly the end screen
+                        // (real one scores ~95%); only borderline reads wait for a
+                        // 2nd confirmation. This catches people who click away fast.
+                        bool sure = (conf >= INSTANT_CONF) || (g_hitStreak >= REQUIRED_STREAK);
+                        if (sure && !g_reminded) {
                             g_reminded = true; showReminder(true); fired = true;
                         }
                     } else {
@@ -970,12 +1112,13 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_HOTKEY:
         switch (wp) {
-        case HK_TRIGGER: showReminder(false); return 0;
-        case HK_HIDE:    ShowWindow(hwnd, IsWindowVisible(hwnd) ? SW_HIDE : SW_SHOW); return 0;
-        case HK_PAUSE:   cmdTogglePause(); return 0;
-        case HK_QUIT:    DestroyWindow(hwnd); return 0;
-        case HK_MOVE:    setMoveMode(!g_moveMode); return 0;
-        case HK_SETTINGS: toggleSettings(); return 0;
+        case ACT_TEST:      showReminder(false); return 0;
+        case ACT_SETTINGS:
+        case ACT_SETTINGS2: toggleSettings(); return 0;
+        case ACT_HIDE:      ShowWindow(hwnd, IsWindowVisible(hwnd) ? SW_HIDE : SW_SHOW); return 0;
+        case ACT_PAUSE:     cmdTogglePause(); return 0;
+        case ACT_MOVE:      setMoveMode(!g_moveMode); return 0;
+        case ACT_QUIT:      DestroyWindow(hwnd); return 0;
         }
         return 0;
 
@@ -1018,12 +1161,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CLOSE: DestroyWindow(hwnd); return 0;
     case WM_DESTROY:
         KillTimer(hwnd, IDT_POLL);
-        UnregisterHotKey(hwnd, HK_TRIGGER);
-        UnregisterHotKey(hwnd, HK_HIDE);
-        UnregisterHotKey(hwnd, HK_PAUSE);
-        UnregisterHotKey(hwnd, HK_QUIT);
-        UnregisterHotKey(hwnd, HK_MOVE);
-        UnregisterHotKey(hwnd, HK_SETTINGS);
+        unregisterHotkeys(hwnd);
         if (g_settings) DestroyWindow(g_settings);
         removeTray();
         PostQuitMessage(0);
@@ -1034,6 +1172,14 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 // ------------------------------------------------------------------- WinMain
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
+    // single instance: if a copy is already running, don't start another (a second
+    // copy would fail to register the hotkeys and make them seem to "not work")
+    HANDLE mtx = CreateMutexW(nullptr, TRUE, L"OvrkWorkoutReminder_singleton");
+    if (mtx && GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND ex = FindWindowW(MAIN_CLASS, nullptr);
+        if (ex) { ShowWindow(ex, SW_SHOW); SetForegroundWindow(ex); }
+        return 0;
+    }
     g_hInst = hInst;
     SetProcessDPIAware();
     srand((unsigned)time(nullptr));
@@ -1048,6 +1194,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     g_fNum    = makeFont(16, FW_BOLD);
     g_fDone   = makeFont(20, FW_BOLD);
 
+    defaultBinds();
     loadWorkouts();
     loadConfig();
     checkDayRollover();

@@ -53,6 +53,9 @@ A clean pop-up menu where everything saves automatically as you change it:
   overlay bar fills toward this as you complete workouts, and resets each day.
 - **All-time reps** — your lifetime total, counted automatically every time you
   finish a workout. Never resets.
+- **Add offline reps** — **+5 / +10 / +25** buttons to log reps you did away from
+  the app (gym, school, wherever). They count toward today's goal and your
+  all-time total, same as a completed reminder.
 - **Show shortcuts on overlay** — when on, the overlay lists all the hotkeys so
   you don't have to remember them.
 
